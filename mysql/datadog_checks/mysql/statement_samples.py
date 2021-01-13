@@ -3,6 +3,7 @@ from concurrent.futures.thread import ThreadPoolExecutor
 from contextlib import closing
 
 import pymysql
+import os
 import time
 from cachetools import TTLCache
 from datadog import statsd
@@ -76,7 +77,7 @@ class MySQLStatementSamples(object):
         self._connection_args = connection_args
         self._checkpoint = 0
         self._log = get_check_logger()
-        self._last_check_run = None
+        self._last_check_run = 0
         self._db = None
         self._tags = None
         self._tags_str = None
@@ -99,41 +100,45 @@ class MySQLStatementSamples(object):
             if t.startswith('service:'):
                 self._service = t[len('service:'):]
         self._last_check_run = time.time()
-        if self._collection_loop_future is None or not self._collection_loop_future.running():
+        if os.environ.get('DBM_STATEMENT_SAMPLER_RUN_INLINE', "false") == "true":
+            self._log.debug("running statement sampler inline")
+            self._collect_once()
+        elif self._collection_loop_future is None or not self._collection_loop_future.running():
             # if it was 'not running' it could have crashed
             self._log.info("starting mysql statement sampler")
             self._collection_loop_future = MySQLStatementSamples.executor.submit(self.collection_loop)
         else:
             self._log.debug("mysql statement sampler already running")
 
-    def collection_loop(self):
-        try:
+    def _collect_once(self):
+        if not self._db:
             # reconnect at the start of each connection loop
             # if the connection fails for whatever reason the loop will exit and be restarted on the next check run
             # pymysql connections are not thread safe so we can't reuse the same connection from the main check
             # in this thread
             self._db = pymysql.connect(**self._connection_args)
+
+        self._rate_limiter.sleep()
+
+        events_statements_table, collect_exec_plans_rate_limit = self._get_sample_collection_strategy()
+        if not events_statements_table:
+            return
+
+        if self._rate_limiter.rate_limit_s != collect_exec_plans_rate_limit:
+            # TODO: should this be (queries collected/s) or (collection loop runs/s)?
+            self._rate_limiter = ConstantRateLimiter(collect_exec_plans_rate_limit)
+
+        self.collect_statement_samples(events_statements_table)
+
+    def collection_loop(self):
+        try:
             self._log.info("started mysql statement sampler collection loop")
             while True:
-                # if the instance check has stopped running for any reason then the collection loop must shut down
-                # this is to ensure that we have only one collection_loop running per check instance
-                if self._last_check_run and time.time() - self._last_check_run > self._config.min_collection_interval \
-                        * 2:
+                if time.time() - self._last_check_run > self._config.min_collection_interval * 2:
                     self._log.info("stopping mysql statement sampler collection loop due to check inactivity")
                     break
-
                 self._rate_limiter.sleep()
-
-                events_statements_table, collect_exec_plans_rate_limit = self._get_sample_collection_strategy()
-                if not events_statements_table:
-                    continue
-
-                if self._rate_limiter.rate_limit_s is None or self._rate_limiter.rate_limit_s != \
-                        collect_exec_plans_rate_limit:
-                    # TODO: should this be (queries collected/s) or (collection loop runs/s)?
-                    self._rate_limiter = ConstantRateLimiter(collect_exec_plans_rate_limit)
-
-                self.collect_statement_samples(events_statements_table)
+                self._collect_once()
         except Exception:
             self._log.exception("mysql statement sampler collection loop failure")
 

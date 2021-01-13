@@ -58,6 +58,7 @@ class PostgresConfig:
         self.service_check_tags = self._get_service_check_tags()
         self.custom_metrics = self._get_custom_metrics(instance.get('custom_metrics', []))
         self.max_relations = int(instance.get('max_relations', 300))
+        self.min_collection_interval = instance.get('min_collection_interval', 15)
 
         # Deep Database monitoring adds additional telemetry for statement metrics
         self.deep_database_monitoring = is_affirmative(instance.get('deep_database_monitoring', False))

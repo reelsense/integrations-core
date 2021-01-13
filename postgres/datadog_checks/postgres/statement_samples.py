@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import psycopg2
@@ -45,9 +46,8 @@ class PostgresStatementSamples(object):
         self.log = get_check_logger()
         self._rate_limiter = ConstantRateLimiter(self.config.collect_statement_samples_rate_limit)
         self._activity_last_query_start = None
-        self._last_check_run = None
-        self._stop_after_inactivity_seconds = 60
-        self._future = None
+        self._last_check_run = 0
+        self._collection_loop_future = None
         self._tags = None
         self._tags_str = None
         self._service = "postgres"
@@ -66,14 +66,18 @@ class PostgresStatementSamples(object):
         for t in self._tags:
             if t.startswith('service:'):
                 self._service = t[len('service:'):]
+        # store the last check run time so we can detect when the check has stopped running
         self._last_check_run = time.time()
-        if self._future is None or not self._future.running():
+        if os.environ.get('DBM_STATEMENT_SAMPLER_RUN_INLINE', "false") == "true":
+            self.log.debug("running statement sampler inline")
+            self.collect_statement_samples()
+        elif self._collection_loop_future is None or not self._collection_loop_future.running():
             self.log.info("starting postgres statement sampler")
-            self._future = PostgresStatementSamples.executor.submit(self.collection_loop)
+            self._collection_loop_future = PostgresStatementSamples.executor.submit(self.collection_loop)
         else:
             self.log.debug("postgres statement sampler already running")
 
-    def _get_new_pg_stat_activity(self, db, instance_tags=None):
+    def _get_new_pg_stat_activity(self, db):
         start_time = time.time()
         query = """
         SELECT * FROM {pg_stat_activity_view}
@@ -91,11 +95,11 @@ class PostgresStatementSamples(object):
             rows = cursor.fetchall()
 
         statsd.histogram(
-            "dd.postgres.get_new_pg_stat_activity.time", (time.time() - start_time) * 1000, tags=instance_tags
+            "dd.postgres.get_new_pg_stat_activity.time", (time.time() - start_time) * 1000, tags=self._tags
         )
         # TODO: once stable, either remove these development metrics or make them configurable in a debug mode
-        statsd.histogram("dd.postgres.get_new_pg_stat_activity.rows", len(rows), tags=instance_tags)
-        statsd.increment("dd.postgres.get_new_pg_stat_activity.total_rows", len(rows), tags=instance_tags)
+        statsd.histogram("dd.postgres.get_new_pg_stat_activity.rows", len(rows), tags=self._tags)
+        statsd.increment("dd.postgres.get_new_pg_stat_activity.total_rows", len(rows), tags=self._tags)
 
         for r in rows:
             if r['query'] and r['datname'] and self.can_explain_statement(r['query']):
@@ -106,19 +110,19 @@ class PostgresStatementSamples(object):
     def collection_loop(self):
         try:
             while True:
-                self.collect_statement_samples()
-                self._rate_limiter.sleep()
-                if time.time() - self._last_check_run > self._stop_after_inactivity_seconds:
+                if time.time() - self._last_check_run > self.config.min_collection_interval * 2:
                     self.log.info("sampler collection_loop stopping due to check inactivity")
                     break
+                self._rate_limiter.sleep()
+                self.collect_statement_samples()
         except Exception:
             self.log.exception("statement sample collection loop failure")
 
     def collect_statement_samples(self):
         start_time = time.time()
 
-        samples = self._get_new_pg_stat_activity(self.postgres_check.db, instance_tags=self._tags)
-        events = self._explain_new_pg_stat_activity(self.postgres_check.db, samples, self._tags)
+        samples = self._get_new_pg_stat_activity(self.postgres_check.db)
+        events = self._explain_new_pg_stat_activity(self.postgres_check.db, samples)
         submit_statement_sample_events(events)
 
         elapsed_ms = (time.time() - start_time) * 1000
@@ -144,7 +148,7 @@ class PostgresStatementSamples(object):
             return False
         return True
 
-    def _run_explain(self, db, statement, instance_tags=None):
+    def _run_explain(self, db, statement):
         if not self.can_explain_statement(statement):
             return
         with db.cursor() as cursor:
@@ -156,7 +160,7 @@ class PostgresStatementSamples(object):
                     )
                 )
                 result = cursor.fetchone()
-                statsd.histogram("dd.postgres.run_explain.time", (time.time() - start_time) * 1000, tags=instance_tags)
+                statsd.histogram("dd.postgres.run_explain.time", (time.time() - start_time) * 1000, tags=self._tags)
             except psycopg2.errors.UndefinedFunction:
                 self.log.warn(
                     "Failed to collect execution plan due to undefined explain_function: %s.",
@@ -164,14 +168,14 @@ class PostgresStatementSamples(object):
                 )
                 return None
             except Exception as e:
-                statsd.increment("dd.postgres.run_explain.error", tags=instance_tags)
+                statsd.increment("dd.postgres.run_explain.error", tags=self._tags)
                 self.log.error("failed to collect execution plan for query='%s'. (%s): %s", statement, type(e), e)
                 return None
         if not result or len(result) < 1 or len(result[0]) < 1:
             return None
         return result[0][0]
 
-    def _explain_new_pg_stat_activity(self, db, samples, instance_tags):
+    def _explain_new_pg_stat_activity(self, db, samples):
         for row in samples:
             original_statement = row['query']
             # TODO: should we cache for the obfuscated statement to avoid re-explaining the same normalized query?
@@ -179,7 +183,7 @@ class PostgresStatementSamples(object):
                 continue
             self.seen_statements_cache[original_statement] = True
             # TODO: add configurable ratelimiting for explains/s
-            plan_dict = self._run_explain(db, original_statement, instance_tags)
+            plan_dict = self._run_explain(db, original_statement)
 
             # Plans have several important signatures to tag events with. Note that for postgres, the
             # query_signature and resource_hash will be the same value.

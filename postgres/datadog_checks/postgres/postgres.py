@@ -439,8 +439,6 @@ class PostgreSql(AgentCheck):
                 self._collect_per_statement_metrics(tags)
                 if self.config.collect_statement_samples:
                     self.statement_samples.run_sampler(tags)
-            import time
-            time.sleep(30)
 
         except Exception as e:
             self.log.error("Unable to collect postgres metrics.")

@@ -160,25 +160,29 @@ logs_common_keys = {
 }
 
 
+def _to_logs_event(e):
+    """
+    Converts a database query track event to a logs event
+    """
+    m = {k: v for k, v in e.items() if k in logs_common_keys}
+    m['message'] = {k: v for k, v in e.items() if k not in logs_common_keys}
+    m['hostname'] = m['host']
+    del m['host']
+    return m
+
+
 def submit_statement_sample_events(events):
     """
     Submit the execution plan events to the event intake
     https://docs.datadoghq.com/api/v1/logs/#send-logs
     """
 
-    def to_logs_event(e):
-        m = {k: v for k, v in e.items() if k in logs_common_keys}
-        m['message'] = {k: v for k, v in e.items() if k not in logs_common_keys}
-        m['hostname'] = m['host']
-        del m['host']
-        return m
-
     for chunk in chunks(events, 100):
         for http, url in _get_event_endpoints():
             is_dbquery = 'dbquery' in url
             try:
                 r = http.request('post', url,
-                                 data=json.dumps([to_logs_event(e) if not is_dbquery else e for e in chunk],
+                                 data=json.dumps([_to_logs_event(e) if not is_dbquery else e for e in chunk],
                                                  cls=EventEncoder),
                                  timeout=5,
                                  headers={'Content-Type': 'application/json'})
