@@ -34,6 +34,7 @@ pg_stat_activity_sample_exclude_keys = {
     'client_port',
 }
 
+
 class PostgresStatementSamples(object):
     # TODO: see what we should set max_workers to
     executor = ThreadPoolExecutor()
@@ -68,9 +69,10 @@ class PostgresStatementSamples(object):
                 self._service = t[len('service:'):]
         # store the last check run time so we can detect when the check has stopped running
         self._last_check_run = time.time()
-        if os.environ.get('DBM_STATEMENT_SAMPLER_RUN_INLINE', "false") == "true":
+        if os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true") != "true":
+            # for debugging while developing the check locally
             self.log.debug("running statement sampler inline")
-            self.collect_statement_samples()
+            self._collect_statement_samples()
         elif self._collection_loop_future is None or not self._collection_loop_future.running():
             self.log.info("starting postgres statement sampler")
             self._collection_loop_future = PostgresStatementSamples.executor.submit(self.collection_loop)
@@ -113,12 +115,13 @@ class PostgresStatementSamples(object):
                 if time.time() - self._last_check_run > self.config.min_collection_interval * 2:
                     self.log.info("sampler collection_loop stopping due to check inactivity")
                     break
-                self._rate_limiter.sleep()
-                self.collect_statement_samples()
+                self._collect_statement_samples()
         except Exception:
             self.log.exception("statement sample collection loop failure")
 
-    def collect_statement_samples(self):
+    def _collect_statement_samples(self):
+        self._rate_limiter.sleep()
+
         start_time = time.time()
 
         samples = self._get_new_pg_stat_activity(self.postgres_check.db)
