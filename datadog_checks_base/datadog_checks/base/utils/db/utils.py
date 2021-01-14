@@ -1,10 +1,7 @@
 # (C) Datadog, Inc. 2019-present
 # All rights reserved
 # Licensed under a 3-clause BSD style license (see LICENSE)
-from datetime import datetime
-import threading
 import time
-from datetime import timedelta
 from itertools import chain
 
 import pytz
@@ -84,29 +81,3 @@ class ConstantRateLimiter:
         sleep_amount = max(self.period_s - elapsed_s, 0)
         time.sleep(sleep_amount)
         self.last_event = time.time()
-
-class ExpiringCache(dict):
-    """
-    Simple expiring key-value cache.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.cache = {}
-        self.lock = threading.Lock()
-
-    def set(self, key, val, expire_seconds):
-        """
-        set key=value, expiring after expire_seconds
-        """
-        expire_at = time.time() + expire_seconds
-        self.cache[key] = (val, expire_at)
-
-    def get(self, key, default=None):
-        val, expire_at = self.cache.get(key, (default, -1))
-        if 0 < expire_at < time.time():
-            with self.lock:
-                if key in self.cache:
-                    del self.cache[key]
-            return default
-        return val

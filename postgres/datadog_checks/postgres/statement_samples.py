@@ -52,9 +52,7 @@ class PostgresStatementSamples(object):
         self._tags = None
         self._tags_str = None
         self._service = "postgres"
-        # avoid reprocessing the exact same statements & plans
-        self.seen_statements_cache = TTLCache(maxsize=1000, ttl=60)
-        self.seen_statements_plan_sigs_cache = TTLCache(maxsize=1000, ttl=60)
+        self.seen_samples_cache = TTLCache(maxsize=1000, ttl=60)
 
     def run_sampler(self, tags):
         """
@@ -104,7 +102,7 @@ class PostgresStatementSamples(object):
         statsd.increment("dd.postgres.get_new_pg_stat_activity.total_rows", len(rows), tags=self._tags)
 
         for r in rows:
-            if r['query'] and r['datname'] and self.can_explain_statement(r['query']):
+            if r['query'] and r['datname']:
                 if self._activity_last_query_start is None or r['query_start'] > self._activity_last_query_start:
                     self._activity_last_query_start = r['query_start']
                 yield r
@@ -129,21 +127,16 @@ class PostgresStatementSamples(object):
         submit_statement_sample_events(events)
 
         elapsed_ms = (time.time() - start_time) * 1000
-        statsd.histogram(
-            "dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags
-        )
-        statsd.gauge("dd.postgres.collect_statement_samples.seen_statements_cache.len", len(self.seen_statements_cache),
+        statsd.histogram("dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags)
+        statsd.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self.seen_samples_cache),
                      tags=self._tags)
-        statsd.gauge(
-            "dd.postgres.collect_statement_samples.seen_statement_plan_sigs_cache.len",
-            len(self.seen_statements_plan_sigs_cache),
-            tags=self._tags,
-        )
 
     def can_explain_statement(self, statement):
         # TODO: cleaner query cleaning to strip comments, etc.
         if statement == '<insufficient privilege>':
             self.log.warn("Insufficient privilege to collect statement.")
+            return False
+        if statement.startswith("autovacuum"):
             return False
         if statement.strip().split(' ', 1)[0].lower() not in VALID_EXPLAIN_STATEMENTS:
             return False
@@ -178,14 +171,23 @@ class PostgresStatementSamples(object):
             return None
         return result[0][0]
 
+    def _can_obfuscate_statement(self, statement):
+        if statement.startswith('SELECT {}'.format(self.config.collect_statement_samples_explain_function)):
+            return False
+        return True
+
     def _explain_new_pg_stat_activity(self, db, samples):
         for row in samples:
             original_statement = row['query']
-            # TODO: should we cache for the obfuscated statement to avoid re-explaining the same normalized query?
-            if original_statement in self.seen_statements_cache:
+            if not self._can_obfuscate_statement(original_statement):
                 continue
-            self.seen_statements_cache[original_statement] = True
-            # TODO: add configurable ratelimiting for explains/s
+
+            try:
+                obfuscated_statement = datadog_agent.obfuscate_sql(original_statement)
+            except Exception:
+                self.log.exception("failed to obfuscate statement='%s'", original_statement)
+                continue
+
             plan_dict = self._run_explain(db, original_statement)
 
             # Plans have several important signatures to tag events with. Note that for postgres, the
@@ -201,12 +203,10 @@ class PostgresStatementSamples(object):
                 plan_signature = compute_exec_plan_signature(normalized_plan)
                 plan_cost = (plan_dict.get('Plan', {}).get('Total Cost', 0.0) or 0.0)
 
-            obfuscated_statement = datadog_agent.obfuscate_sql(original_statement)
             query_signature = compute_sql_signature(obfuscated_statement)
-            apm_resource_hash = query_signature
             statement_plan_sig = (query_signature, plan_signature)
-            if statement_plan_sig not in self.seen_statements_plan_sigs_cache:
-                self.seen_statements_plan_sigs_cache[statement_plan_sig] = True
+            if statement_plan_sig not in self.seen_samples_cache:
+                self.seen_samples_cache[statement_plan_sig] = True
                 event = {
                     # the timestamp for activity events is the time at which they were collected
                     "timestamp": time.time() * 1000,
@@ -232,7 +232,7 @@ class PostgresStatementSamples(object):
                             "signature": plan_signature
                         },
                         "query_signature": query_signature,
-                        "resource_hash": apm_resource_hash,
+                        "resource_hash": query_signature,
                         "application": row.get('application_name', None),
                         "user": row['usename'],
                         "statement": obfuscated_statement
