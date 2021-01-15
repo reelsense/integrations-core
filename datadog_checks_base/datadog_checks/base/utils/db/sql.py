@@ -141,8 +141,8 @@ def _get_event_endpoints():
     if _logs_endpoints:
         return _logs_endpoints
 
-    endpoints = _load_event_endpoints_from_config("dbm_config", default_dbm_url)
-    if datadog_agent.get_config('dbm_config.double_write_to_logs'):
+    endpoints = _load_event_endpoints_from_config("database_monitoring_config", default_dbm_url)
+    if datadog_agent.get_config('database_monitoring_config.double_write_to_logs'):
         LOGGER.debug("DBM double writing to logs enabled")
         endpoints.extend(_load_event_endpoints_from_config("logs_config", default_logs_url))
     # TODO: support other logs endpoint config options use_http, use_compression, compression_level
