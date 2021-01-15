@@ -66,11 +66,7 @@ class PostgresConfig:
         self.pg_stat_statements_view = instance.get('pg_stat_statements_view', 'pg_stat_statements')
         # statement samples & execution plans
         self.pg_stat_activity_view = instance.get('pg_stat_activity_view', 'pg_stat_activity')
-        # defaults to true only if DBM is enabled, and it can optionally be disabled
-        self.collect_statement_samples = is_affirmative(instance.get('collect_statement_samples', True))
-        self.collect_statement_samples_rate_limit = instance.get('collect_statement_samples_rate_limit', 10)
-        self.collect_statement_samples_explain_function = instance.get('collect_statement_samples_explain_function', 'public.explain_statement')
-        self.collect_statement_samples_debug = instance.get('collect_statement_samples_debug', False)
+        self.statement_samples_config = instance.get('statement_samples', {})
 
     def _build_tags(self, custom_tags):
         # Clean up tags in case there was a None entry in the instance

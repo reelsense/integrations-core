@@ -437,8 +437,7 @@ class PostgreSql(AgentCheck):
             self._collect_custom_queries(tags)
             if self.config.deep_database_monitoring:
                 self._collect_per_statement_metrics(tags)
-                if self.config.collect_statement_samples:
-                    self.statement_samples.run_sampler(tags)
+                self.statement_samples.run_sampler(tags)
 
         except Exception as e:
             self.log.error("Unable to collect postgres metrics.")

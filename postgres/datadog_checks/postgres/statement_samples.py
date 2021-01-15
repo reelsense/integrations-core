@@ -36,23 +36,40 @@ pg_stat_activity_sample_exclude_keys = {
 
 
 class PostgresStatementSamples(object):
-    # TODO: see what we should set max_workers to
     executor = ThreadPoolExecutor()
 
     """Collects telemetry for SQL statements"""
 
     def __init__(self, postgres_check):
-        self.postgres_check = postgres_check
-        self.config = postgres_check.config
-        self.log = get_check_logger()
-        self._rate_limiter = ConstantRateLimiter(self.config.collect_statement_samples_rate_limit)
+        self._postgres_check = postgres_check
+        self._config = postgres_check.config
+        self._log = get_check_logger()
         self._activity_last_query_start = None
         self._last_check_run = 0
         self._collection_loop_future = None
         self._tags = None
         self._tags_str = None
         self._service = "postgres"
-        self.seen_samples_cache = TTLCache(maxsize=1000, ttl=60)
+        self._enabled = self._config.statement_samples_config.get('enabled', True)
+        self._debug = self._config.statement_samples_config.get('debug', False)
+        self._rate_limiter = ConstantRateLimiter(
+            self._config.statement_samples_config.get('collections_per_second', 10))
+        # cache for rate limiting unique samples ingested
+        # a sample is unique based on its (query_signature, plan_signature)
+        self._seen_samples_cache = TTLCache(
+            # key: (query_signature, plan_signature) = 16 bytes
+            # cache:
+            # - each key dict overhead, 2 pointers (key, value) = 16 bytes
+            # - ordered dict overhead, 2 pointers (next, prev) = 16 bytes
+            # - key hash = 8 bytes
+            # total:
+            # - per sample memory = 56 bytes
+            # - maxsize samples: 10k * 56 = ~0.5 Mb
+            maxsize=self._config.statement_samples_config.get('seen_samples_cache_maxsize', 10000),
+            ttl=60 * 60 / self._config.statement_samples_config.get('samples_per_hour_per_query', 30)
+        )
+        self._explain_function = self._config.statement_samples_config.get('explain_function',
+                                                                           'public.explain_statement')
 
     def run_sampler(self, tags):
         """
@@ -60,6 +77,9 @@ class PostgresStatementSamples(object):
         :param tags:
         :return:
         """
+        if not self._enabled:
+            self._log.debug("skipping statement samples as it's not enabled")
+            return
         self._tags = tags
         self._tags_str = ','.join(self._tags)
         for t in self._tags:
@@ -69,13 +89,13 @@ class PostgresStatementSamples(object):
         self._last_check_run = time.time()
         if os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true") != "true":
             # for debugging while developing the check locally
-            self.log.debug("running statement sampler inline")
+            self._log.debug("running statement sampler synchronously")
             self._collect_statement_samples()
         elif self._collection_loop_future is None or not self._collection_loop_future.running():
-            self.log.info("starting postgres statement sampler")
+            self._log.info("starting postgres statement sampler")
             self._collection_loop_future = PostgresStatementSamples.executor.submit(self.collection_loop)
         else:
-            self.log.debug("postgres statement sampler already running")
+            self._log.debug("postgres statement sampler already running")
 
     def _get_new_pg_stat_activity(self, db):
         start_time = time.time()
@@ -84,14 +104,14 @@ class PostgresStatementSamples(object):
         WHERE datname = %s
         AND coalesce(TRIM(query), '') != ''
         """.format(
-            pg_stat_activity_view=self.config.pg_stat_activity_view
+            pg_stat_activity_view=self._config.pg_stat_activity_view
         )
         db.rollback()
         with db.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             if self._activity_last_query_start:
-                cursor.execute(query + " AND query_start > %s", (self.config.dbname, self._activity_last_query_start,))
+                cursor.execute(query + " AND query_start > %s", (self._config.dbname, self._activity_last_query_start,))
             else:
-                cursor.execute(query, (self.config.dbname,))
+                cursor.execute(query, (self._config.dbname,))
             rows = cursor.fetchall()
 
         statsd.histogram(
@@ -110,37 +130,37 @@ class PostgresStatementSamples(object):
     def collection_loop(self):
         try:
             while True:
-                if time.time() - self._last_check_run > self.config.min_collection_interval * 2:
-                    self.log.info("sampler collection_loop stopping due to check inactivity")
+                if time.time() - self._last_check_run > self._config.min_collection_interval * 2:
+                    self._log.info("sampler collection_loop stopping due to check inactivity")
                     break
                 self._collect_statement_samples()
         except Exception:
-            self.log.exception("statement sample collection loop failure")
+            self._log.exception("statement sample collection loop failure")
 
     def _collect_statement_samples(self):
         self._rate_limiter.sleep()
 
         start_time = time.time()
 
-        samples = self._get_new_pg_stat_activity(self.postgres_check.db)
-        events = self._explain_new_pg_stat_activity(self.postgres_check.db, samples)
+        samples = self._get_new_pg_stat_activity(self._postgres_check.db)
+        events = self._explain_new_pg_stat_activity(self._postgres_check.db, samples)
         submit_statement_sample_events(events)
 
         elapsed_ms = (time.time() - start_time) * 1000
         statsd.histogram("dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags)
-        statsd.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self.seen_samples_cache),
+        statsd.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self._seen_samples_cache),
                      tags=self._tags)
 
     def can_explain_statement(self, statement):
         # TODO: cleaner query cleaning to strip comments, etc.
         if statement == '<insufficient privilege>':
-            self.log.warn("Insufficient privilege to collect statement.")
+            self._log.warn("Insufficient privilege to collect statement.")
             return False
         if statement.startswith("autovacuum"):
             return False
         if statement.strip().split(' ', 1)[0].lower() not in VALID_EXPLAIN_STATEMENTS:
             return False
-        if statement.startswith('SELECT {}'.format(self.config.collect_statement_samples_explain_function)):
+        if statement.startswith('SELECT {}'.format(self._explain_function)):
             return False
         return True
 
@@ -152,27 +172,27 @@ class PostgresStatementSamples(object):
                 start_time = time.time()
                 cursor.execute(
                     """SELECT {explain_function}($stmt${statement}$stmt$)""".format(
-                        explain_function=self.config.collect_statement_samples_explain_function, statement=statement
+                        explain_function=self._explain_function, statement=statement
                     )
                 )
                 result = cursor.fetchone()
                 statsd.histogram("dd.postgres.run_explain.time", (time.time() - start_time) * 1000, tags=self._tags)
             except psycopg2.errors.UndefinedFunction:
-                self.log.warn(
+                self._log.warn(
                     "Failed to collect execution plan due to undefined explain_function: %s.",
-                    self.config.collect_statement_samples_explain_function,
+                    self._explain_function,
                 )
                 return None
             except Exception as e:
                 statsd.increment("dd.postgres.run_explain.error", tags=self._tags)
-                self.log.error("failed to collect execution plan for query='%s'. (%s): %s", statement, type(e), e)
+                self._log.error("failed to collect execution plan for query='%s'. (%s): %s", statement, type(e), e)
                 return None
         if not result or len(result) < 1 or len(result[0]) < 1:
             return None
         return result[0][0]
 
     def _can_obfuscate_statement(self, statement):
-        if statement.startswith('SELECT {}'.format(self.config.collect_statement_samples_explain_function)):
+        if statement.startswith('SELECT {}'.format(self._explain_function)):
             return False
         return True
 
@@ -185,7 +205,7 @@ class PostgresStatementSamples(object):
             try:
                 obfuscated_statement = datadog_agent.obfuscate_sql(original_statement)
             except Exception:
-                self.log.exception("failed to obfuscate statement='%s'", original_statement)
+                self._log.exception("failed to obfuscate statement='%s'", original_statement)
                 continue
 
             plan_dict = self._run_explain(db, original_statement)
@@ -205,13 +225,13 @@ class PostgresStatementSamples(object):
 
             query_signature = compute_sql_signature(obfuscated_statement)
             statement_plan_sig = (query_signature, plan_signature)
-            if statement_plan_sig not in self.seen_samples_cache:
-                self.seen_samples_cache[statement_plan_sig] = True
+            if statement_plan_sig not in self._seen_samples_cache:
+                self._seen_samples_cache[statement_plan_sig] = True
                 event = {
                     # the timestamp for activity events is the time at which they were collected
                     "timestamp": time.time() * 1000,
                     # TODO: if "localhost" then use agent hostname instead
-                    "host": self.config.host,
+                    "host": self._config.host,
                     "service": self._service,
                     "ddsource": "postgres",
                     "ddtags": self._tags_str,
@@ -239,7 +259,7 @@ class PostgresStatementSamples(object):
                     },
                     'postgres': {k: v for k, v in row.items() if k not in pg_stat_activity_sample_exclude_keys},
                 }
-                if self.config.collect_statement_samples_debug:
+                if self._debug:
                     event['db']['debug'] = {
                         'original_plan': plan,
                         'normalized_plan': normalized_plan,
