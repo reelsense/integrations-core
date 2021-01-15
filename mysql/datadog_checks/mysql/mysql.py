@@ -112,8 +112,7 @@ class MySql(AgentCheck):
                 self._collect_system_metrics(self.config.host, db, self.config.tags)
                 if self.config.deep_database_monitoring:
                     self._collect_statement_metrics(db, self.config.tags)
-                    if self.config.collect_statement_samples:
-                        self._statement_samples.run_sampler(self.service_check_tags)
+                    self._statement_samples.run_sampler(self.service_check_tags)
 
                 # keeping track of these:
                 self._put_qcache_stats()

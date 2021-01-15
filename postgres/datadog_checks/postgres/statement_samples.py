@@ -5,6 +5,7 @@ import time
 import psycopg2
 from cachetools import TTLCache
 from datadog_checks.base.log import get_check_logger
+from datadog_checks.base import is_affirmative
 
 try:
     import datadog_agent
@@ -50,21 +51,15 @@ class PostgresStatementSamples(object):
         self._tags = None
         self._tags_str = None
         self._service = "postgres"
-        self._enabled = self._config.statement_samples_config.get('enabled', True)
-        self._debug = self._config.statement_samples_config.get('debug', False)
+        self._enabled = is_affirmative(self._config.statement_samples_config.get('enabled', True))
+        self._debug = is_affirmative(self._config.statement_samples_config.get('debug', False))
         self._rate_limiter = ConstantRateLimiter(
             self._config.statement_samples_config.get('collections_per_second', 10))
         # cache for rate limiting unique samples ingested
         # a sample is unique based on its (query_signature, plan_signature)
         self._seen_samples_cache = TTLCache(
-            # key: (query_signature, plan_signature) = 16 bytes
-            # cache:
-            # - each key dict overhead, 2 pointers (key, value) = 16 bytes
-            # - ordered dict overhead, 2 pointers (next, prev) = 16 bytes
-            # - key hash = 8 bytes
-            # total:
-            # - per sample memory = 56 bytes
-            # - maxsize samples: 10k * 56 = ~0.5 Mb
+            # assuming ~60 bytes per entry (query & plan signature, key hash, 4 pointers (ordered dict), expiry time)
+            # total size: 10k * 60 = 0.6 Mb
             maxsize=self._config.statement_samples_config.get('seen_samples_cache_maxsize', 10000),
             ttl=60 * 60 / self._config.statement_samples_config.get('samples_per_hour_per_query', 30)
         )
@@ -151,16 +146,21 @@ class PostgresStatementSamples(object):
         statsd.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self._seen_samples_cache),
                      tags=self._tags)
 
-    def can_explain_statement(self, statement):
-        # TODO: cleaner query cleaning to strip comments, etc.
+    def _can_obfuscate_statement(self, statement):
         if statement == '<insufficient privilege>':
             self._log.warn("Insufficient privilege to collect statement.")
             return False
-        if statement.startswith("autovacuum"):
+        if statement.startswith('SELECT {}'.format(self._explain_function)):
+            return False
+        if statement.startswith('autovacuum:'):
+            return False
+        return True
+
+    def can_explain_statement(self, statement):
+        # TODO: cleaner query cleaning to strip comments, etc.
+        if not self._can_obfuscate_statement(statement):
             return False
         if statement.strip().split(' ', 1)[0].lower() not in VALID_EXPLAIN_STATEMENTS:
-            return False
-        if statement.startswith('SELECT {}'.format(self._explain_function)):
             return False
         return True
 
@@ -190,11 +190,6 @@ class PostgresStatementSamples(object):
         if not result or len(result) < 1 or len(result[0]) < 1:
             return None
         return result[0][0]
-
-    def _can_obfuscate_statement(self, statement):
-        if statement.startswith('SELECT {}'.format(self._explain_function)):
-            return False
-        return True
 
     def _explain_new_pg_stat_activity(self, db, samples):
         for row in samples:

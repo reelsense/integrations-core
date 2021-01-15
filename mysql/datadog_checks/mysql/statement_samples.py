@@ -85,17 +85,17 @@ class MySQLStatementSamples(object):
         self._service = "mysql"
         self._collection_loop_future = None
         self._rate_limiter = ConstantRateLimiter(1)
-        self._collection_strategy_cache = TTLCache(maxsize=1000, ttl=600)
-        self._seen_samples_cache = TTLCache(maxsize=1000, ttl=60)
         self._config = config
+        self._enabled = is_affirmative(self._config.statement_samples_config.get('enabled', True))
+        self._debug = is_affirmative(self._config.statement_samples_config.get('debug', False))
         self._auto_enable_events_statements_consumers = is_affirmative(
-            self._config.options.get('auto_enable_events_statements_consumers', False))
-        self._collect_statement_samples_rate_limit = self._config.options.get('collect_statement_samples_rate_limit',
-                                                                              -1)
-        self._events_statements_row_limit = self._config.options.get('events_statements_row_limit', 5000)
-
+            self._config.statement_samples_config.get('auto_enable_events_statements_consumers', False))
+        self._collections_per_second = self._config.statement_samples_config.get('collections_per_second', -1)
+        self._events_statements_row_limit = self._config.statement_samples_config.get('events_statements_row_limit',
+                                                                                      5000)
+        self._explain_procedure = self._config.statement_samples_config.get('explain_procedure', 'explain_statement')
         self._preferred_events_statements_tables = EVENTS_STATEMENTS_PREFERRED_TABLES
-        events_statements_table = self._config.options.get('events_statements_table', None)
+        events_statements_table = self._config.statement_samples_config.get('events_statements_table', None)
         if events_statements_table:
             if events_statements_table in DEFAULT_EVENTS_STATEMENTS_RATE_LIMITS:
                 self._log.info("using configured events_statements_table: %s", events_statements_table)
@@ -106,6 +106,16 @@ class MySQLStatementSamples(object):
                     events_statements_table,
                     ', '.join(DEFAULT_EVENTS_STATEMENTS_RATE_LIMITS.keys()),
                 )
+        self._collection_strategy_cache = TTLCache(
+            maxsize=self._config.statement_samples_config.get('collection_strategy_cache_maxsize', 1000),
+            ttl=self._config.statement_samples_config.get('collection_strategy_cache_ttl', 300)
+        )
+        self._seen_samples_cache = TTLCache(
+            # assuming ~60 bytes per entry (query & plan signature, key hash, 4 pointers (ordered dict), expiry time)
+            # total size: 10k * 60 = 0.6 Mb
+            maxsize=self._config.statement_samples_config.get('seen_samples_cache_maxsize', 10000),
+            ttl=60 * 60 / self._config.statement_samples_config.get('samples_per_hour_per_query', 30)
+        )
 
     def run_sampler(self, tags):
         """
@@ -320,7 +330,7 @@ class MySQLStatementSamples(object):
 
         enabled_consumers = self._get_enabled_performance_schema_consumers()
 
-        rate_limit = self._collect_statement_samples_rate_limit
+        rate_limit = self._collections_per_second
         events_statements_table = None
         for table in self._preferred_events_statements_tables:
             if table not in enabled_consumers:
@@ -473,7 +483,7 @@ class MySQLStatementSamples(object):
         """
         Run the explain by calling the stored procedure `explain_statement` if available.
         """
-        cursor.execute('CALL explain_statement(%s)', statement)
+        cursor.execute('CALL {}(%s)'.format(self._explain_procedure), statement)
         return cursor.fetchone()[0]
 
     @staticmethod
