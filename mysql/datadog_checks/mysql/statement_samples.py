@@ -6,7 +6,6 @@ from contextlib import closing
 
 import pymysql
 from cachetools import TTLCache
-from datadog import statsd
 from datadog_checks.base import is_affirmative
 from datadog_checks.base.log import get_check_logger
 from datadog_checks.base.utils.db.sql import compute_exec_plan_signature, compute_sql_signature, \
@@ -73,7 +72,8 @@ class MySQLStatementSamples(object):
     using the permissions of the procedure definer.
     """
 
-    def __init__(self, config, connection_args):
+    def __init__(self, check, config, connection_args):
+        self._check = check
         self._connection_args = connection_args
         # checkpoint at zero so we pull the whole history table on the first run
         self._checkpoint = 0
@@ -129,9 +129,8 @@ class MySQLStatementSamples(object):
             if t.startswith('service:'):
                 self._service = t[len('service:'):]
         self._last_check_run = time.time()
-        if os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true") != "true":
-            # for debugging while developing the check locally
-            self._log.debug("running statement sampler inline")
+        if not is_affirmative(os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true")):
+            self._log.debug("running statement sampler synchronously")
             self._collect_statement_samples()
         elif self._collection_loop_future is None or not self._collection_loop_future.running():
             self._log.info("starting mysql statement sampler")
@@ -160,7 +159,7 @@ class MySQLStatementSamples(object):
         except Exception:
             self._log.exception("mysql statement sampler collection loop failure")
 
-    def _get_events_statements_by_digest(self, events_statements_table, row_limit):
+    def _get_new_events_statements(self, events_statements_table, row_limit):
         start = time.time()
 
         # Select the most recent events with a bias towards events which have higher wait times
@@ -210,8 +209,8 @@ class MySQLStatementSamples(object):
             self._checkpoint = max(r['timer_start'] for r in rows)
             cursor.execute('SET @@SESSION.sql_notes = 0')
             tags = ["table:%s".format(events_statements_table)] + self._tags
-            statsd.increment("dd.mysql.events_statements_by_digest.rows", len(rows), tags=tags)
-            statsd.timing("dd.mysql.events_statements_by_digest.time", (time.time() - start) * 1000, tags=tags)
+            self._check.histogram("dd.mysql.get_new_events_statements.time", (time.time() - start) * 1000, tags=tags)
+            self._check.histogram("dd.mysql.get_new_events_statements.rows", len(rows), tags=tags)
             return rows
 
     def _filter_valid_statement_rows(self, rows):
@@ -340,7 +339,7 @@ class MySQLStatementSamples(object):
                 if not self._performance_schema_enable_consumer(table):
                     continue
                 self._log.debug("successfully enabled performance_schema consumer")
-            rows = self._get_events_statements_by_digest(table, 1)
+            rows = self._get_new_events_statements(table, 1)
             if not rows:
                 self._log.debug("no statements found in %s", table)
                 continue
@@ -373,21 +372,23 @@ class MySQLStatementSamples(object):
             self._rate_limiter = ConstantRateLimiter(rate_limit)
 
         start_time = time.time()
-        rows = self._get_events_statements_by_digest(events_statements_table, self._events_statements_row_limit)
+        rows = self._get_new_events_statements(events_statements_table, self._events_statements_row_limit)
         events = self._collect_plans_for_statements(rows)
         submit_statement_sample_events(events)
-        statsd.gauge("dd.mysql.collect_statement_samples.total.time", (time.time() - start_time) * 1000,
-                     tags=self._tags)
-        statsd.gauge("dd.mysql.collect_statement_samples.seen_samples", len(self._seen_samples_cache), tags=self._tags)
+        self._check.histogram("dd.mysql.collect_statement_samples.time", (time.time() - start_time) * 1000,
+                              tags=self._tags)
+        self._check.gauge("dd.mysql.collect_statement_samples.seen_samples_cache.len", len(self._seen_samples_cache),
+                          tags=self._tags)
 
     def _attempt_explain_safe(self, sql_text, schema):
         start_time = time.time()
         with closing(self._get_db_connection().cursor()) as cursor:
             try:
                 plan = self._attempt_explain(cursor, sql_text, schema)
-                statsd.timing("dd.mysql.run_explain.time", (time.time() - start_time) * 1000, tags=self._tags)
+                self._check.histogram("dd.mysql.run_explain.time", (time.time() - start_time) * 1000, tags=self._tags)
                 return plan
             except Exception:
+                self._check.count("dd.mysql.run_explain.error", 1, tags=self._tags)
                 self._log.exception("failed to run explain on query %s", sql_text)
 
     def _attempt_explain(self, cursor, statement, schema):

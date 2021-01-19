@@ -52,7 +52,7 @@ class PostgreSql(AgentCheck):
         self.config = PostgresConfig(self.instance)
         self.metrics_cache = PostgresMetricsCache(self.config)
         self.statement_metrics = PostgresStatementMetrics(self.config)
-        self.statement_samples = PostgresStatementSamples(self)
+        self.statement_samples = PostgresStatementSamples(self, self.config)
         self._clean_state()
 
     def _clean_state(self):

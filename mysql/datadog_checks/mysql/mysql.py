@@ -78,7 +78,7 @@ class MySql(AgentCheck):
         self.innodb_stats = InnoDBMetrics()
         self.check_initializations.append(self.config.configuration_checks)
         self._statement_metrics = MySQLStatementMetrics(self.config)
-        self._statement_samples = MySQLStatementSamples(self.config, self._get_connection_args())
+        self._statement_samples = MySQLStatementSamples(self, self.config, self._get_connection_args())
 
     def execute_query_raw(self, query):
         with closing(self._conn.cursor(pymysql.cursors.SSCursor)) as cursor:

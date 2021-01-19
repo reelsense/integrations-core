@@ -4,15 +4,14 @@ import time
 
 import psycopg2
 from cachetools import TTLCache
-from datadog_checks.base.log import get_check_logger
 from datadog_checks.base import is_affirmative
+from datadog_checks.base.log import get_check_logger
 
 try:
     import datadog_agent
 except ImportError:
     from ..stubs import datadog_agent
 
-from datadog import statsd
 from concurrent.futures.thread import ThreadPoolExecutor
 
 from datadog_checks.base.utils.db.sql import submit_statement_sample_events, compute_exec_plan_signature, \
@@ -41,9 +40,9 @@ class PostgresStatementSamples(object):
 
     """Collects telemetry for SQL statements"""
 
-    def __init__(self, postgres_check):
-        self._postgres_check = postgres_check
-        self._config = postgres_check.config
+    def __init__(self, check, config):
+        self._check = check
+        self._config = config
         self._log = get_check_logger()
         self._activity_last_query_start = None
         self._last_check_run = 0
@@ -82,8 +81,7 @@ class PostgresStatementSamples(object):
                 self._service = t[len('service:'):]
         # store the last check run time so we can detect when the check has stopped running
         self._last_check_run = time.time()
-        if os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true") != "true":
-            # for debugging while developing the check locally
+        if not is_affirmative(os.environ.get('DBM_STATEMENT_SAMPLER_ASYNC', "true")):
             self._log.debug("running statement sampler synchronously")
             self._collect_statement_samples()
         elif self._collection_loop_future is None or not self._collection_loop_future.running():
@@ -109,12 +107,9 @@ class PostgresStatementSamples(object):
                 cursor.execute(query, (self._config.dbname,))
             rows = cursor.fetchall()
 
-        statsd.histogram(
-            "dd.postgres.get_new_pg_stat_activity.time", (time.time() - start_time) * 1000, tags=self._tags
-        )
-        # TODO: once stable, either remove these development metrics or make them configurable in a debug mode
-        statsd.histogram("dd.postgres.get_new_pg_stat_activity.rows", len(rows), tags=self._tags)
-        statsd.increment("dd.postgres.get_new_pg_stat_activity.total_rows", len(rows), tags=self._tags)
+        self._check.histogram("dd.postgres.get_new_pg_stat_activity.time", (time.time() - start_time) * 1000,
+                              tags=self._tags)
+        self._check.histogram("dd.postgres.get_new_pg_stat_activity.rows", len(rows), tags=self._tags)
 
         for r in rows:
             if r['query'] and r['datname']:
@@ -137,14 +132,14 @@ class PostgresStatementSamples(object):
 
         start_time = time.time()
 
-        samples = self._get_new_pg_stat_activity(self._postgres_check.db)
-        events = self._explain_new_pg_stat_activity(self._postgres_check.db, samples)
+        samples = self._get_new_pg_stat_activity(self._check.db)
+        events = self._explain_pg_stat_activity(self._check.db, samples)
         submit_statement_sample_events(events)
 
         elapsed_ms = (time.time() - start_time) * 1000
-        statsd.histogram("dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags)
-        statsd.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self._seen_samples_cache),
-                     tags=self._tags)
+        self._check.histogram("dd.postgres.collect_statement_samples.time", elapsed_ms, tags=self._tags)
+        self._check.gauge("dd.postgres.collect_statement_samples.seen_samples_cache.len", len(self._seen_samples_cache),
+                          tags=self._tags)
 
     def _can_obfuscate_statement(self, statement):
         if statement == '<insufficient privilege>':
@@ -156,7 +151,7 @@ class PostgresStatementSamples(object):
             return False
         return True
 
-    def can_explain_statement(self, statement):
+    def _can_explain_statement(self, statement):
         # TODO: cleaner query cleaning to strip comments, etc.
         if not self._can_obfuscate_statement(statement):
             return False
@@ -165,7 +160,7 @@ class PostgresStatementSamples(object):
         return True
 
     def _run_explain(self, db, statement):
-        if not self.can_explain_statement(statement):
+        if not self._can_explain_statement(statement):
             return
         with db.cursor() as cursor:
             try:
@@ -176,7 +171,8 @@ class PostgresStatementSamples(object):
                     )
                 )
                 result = cursor.fetchone()
-                statsd.histogram("dd.postgres.run_explain.time", (time.time() - start_time) * 1000, tags=self._tags)
+                self._check.histogram("dd.postgres.run_explain.time", (time.time() - start_time) * 1000,
+                                      tags=self._tags)
             except psycopg2.errors.UndefinedFunction:
                 self._log.warn(
                     "Failed to collect execution plan due to undefined explain_function: %s.",
@@ -184,14 +180,14 @@ class PostgresStatementSamples(object):
                 )
                 return None
             except Exception as e:
-                statsd.increment("dd.postgres.run_explain.error", tags=self._tags)
+                self._check.increment("dd.postgres.run_explain.error", tags=self._tags)
                 self._log.error("failed to collect execution plan for query='%s'. (%s): %s", statement, type(e), e)
                 return None
         if not result or len(result) < 1 or len(result[0]) < 1:
             return None
         return result[0][0]
 
-    def _explain_new_pg_stat_activity(self, db, samples):
+    def _explain_pg_stat_activity(self, db, samples):
         for row in samples:
             original_statement = row['query']
             if not self._can_obfuscate_statement(original_statement):
